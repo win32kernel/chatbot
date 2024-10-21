@@ -1,41 +1,65 @@
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, session
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 import os
+import logging
+from collections import deque
+from flask_limiter import Limiter
 
 # Initialize the Flask application
 app = Flask(__name__)
+app.secret_key = os.urandom(24)  # Secure session management
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+
+# Initialize rate limiting
+limiter = Limiter(app, key_func=lambda: request.remote_addr)
 
 # Load the tokenizer and model at startup for performance
+logging.info("Loading tokenizer and model...")
 tokenizer = AutoTokenizer.from_pretrained("EleutherAI/pythia-12b")
 model = AutoModelForCausalLM.from_pretrained("EleutherAI/pythia-12b")
 model.eval()  # Set the model to evaluation mode
+logging.info("Model loaded successfully.")
 
-# Global variable for chat history
-chat_history = []
+# Ensure chat history is stored in the session
+def get_chat_history():
+    """Retrieve chat history from the session."""
+    if 'chat_history' not in session:
+        session['chat_history'] = deque(maxlen=10)
+    return session['chat_history']
 
+def save_chat_history(chat_history):
+    """Save chat history back to the session."""
+    session['chat_history'] = chat_history
 def generate_response(prompt):
     """Generate a response from the model given a prompt."""
+    logging.info(f"Generating response for prompt: {prompt}")  # Log the input prompt
     try:
         inputs = tokenizer(prompt, return_tensors="pt", padding=True)
         input_ids = inputs.input_ids
-        attention_mask = inputs.attention_mask  # Attention mask is created here
+        attention_mask = inputs.attention_mask
 
         with torch.no_grad():
             outputs = model.generate(
                 input_ids,
-                attention_mask=attention_mask,  # Pass attention mask here
+                attention_mask=attention_mask,
                 max_length=150,
                 min_length=8,
                 top_p=0.9,
+                top_k=50,  # Example addition for top-k sampling
                 temperature=0.7,
                 do_sample=True,
-                pad_token_id=tokenizer.eos_token_id  # Ensure the pad_token_id is set
+                pad_token_id=tokenizer.eos_token_id
             )
-        return tokenizer.decode(outputs[0], skip_special_tokens=True)
+        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        logging.info("Generated response successfully.")
+        return response
     except Exception as e:
-        print(f"Error generating response: {e}")
+        logging.error(f"Error generating response: {e}")
         return "I'm sorry, but I'm unable to process your request right now."
+
 
 @app.route("/")
 def index():
@@ -43,6 +67,7 @@ def index():
     return render_template('chat.html')
 
 @app.route("/get", methods=["POST"])
+@limiter.limit("5 per minute")  # Rate limiting
 def chat():
     """Handle chat messages and respond."""
     msg = request.form.get("msg", "").strip()
@@ -57,11 +82,11 @@ def chat():
 
 def get_chat_response(user_input):
     """Generate a chat response based on user input."""
-    global chat_history
+    chat_history = get_chat_history()
 
-    # Maintain a limited chat history for context
+    # Maintain chat history for context
     chat_history.append(f"User: {user_input}")
-    context = " ".join(chat_history[-5:])  # Keep only the last 5 interactions
+    context = " ".join(chat_history)  # Keep all interactions for broader context
 
     instruction = (
         "You are a helpful AI assistant. Always provide informative and relevant answers. "
@@ -75,10 +100,13 @@ def get_chat_response(user_input):
 
     # Append the bot response to the chat history
     chat_history.append(f"AI: {response}")
+    save_chat_history(chat_history)
     
     return response
 
 if __name__ == '__main__':
     from gevent.pywsgi import WSGIServer
-    http_server = WSGIServer(('0.0.0.0', int(os.environ.get("PORT", 5000))), app)
+    port = int(os.environ.get("PORT", 5000))
+    http_server = WSGIServer(('0.0.0.0', port), app)
+    logging.info(f"Starting server on port {port}...")
     http_server.serve_forever()
